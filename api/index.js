@@ -1,5 +1,4 @@
-// api/index.js — AnimeKai Stremio Addon (Vercel Serverless v2)
-// Includes /debug endpoint so you can diagnose scraping issues in browser.
+// api/index.js — AnimeKai Stremio Addon v4 (AniList + AniWatch)
 
 const manifest = require('../manifest');
 const scraper  = require('../scraper');
@@ -28,22 +27,18 @@ module.exports = async (req, res) => {
   if (req.method === 'OPTIONS') { res.status(200).end(); return; }
 
   const path = (req.url || '/').split('?')[0].replace(/\/$/, '') || '/';
-  console.log('[AnimeKai]', req.method, path);
+  console.log('[AnimeKai v4]', req.method, path);
 
   try {
-
-    // ── /manifest.json ────────────────────────────────────────────────────────
     if (path === '/manifest.json' || path === '' || path === '/') {
       return res.status(200).json(manifest);
     }
 
-    // ── /debug — shows scraper status and raw HTML (open in browser) ──────────
     if (path === '/debug') {
       const info = await scraper.getDebugInfo();
       return res.status(200).json(info);
     }
 
-    // ── /catalog/:type/:id.json  or  /catalog/:type/:id/:extra.json ──────────
     const catMatch = path.match(/^\/catalog\/([^/]+)\/([^/]+?)(?:\/([^/]+?))?\.json$/);
     if (catMatch) {
       const [, , catalogId, extraStr] = catMatch;
@@ -57,41 +52,29 @@ module.exports = async (req, res) => {
       else if (catalogId === 'animekai-search')   metas = await scraper.searchAnime(query, skip);
       else if (catalogId === 'animekai-movies')   metas = await scraper.getMovies(skip);
 
-      console.log(`[Catalog] ${catalogId} → ${metas.length} items`);
+      console.log('[Catalog] ' + catalogId + ' -> ' + metas.length + ' items');
       return res.status(200).json({ metas });
     }
 
-    // ── /meta/:type/:id.json ──────────────────────────────────────────────────
     const metaMatch = path.match(/^\/meta\/([^/]+)\/([^/]+?)\.json$/);
     if (metaMatch) {
-      const animeId = metaMatch[2].replace('animekai%3A', '').replace('animekai:', '');
-      const meta    = await scraper.getAnimeMeta(animeId);
+      const rawId = decodeURIComponent(metaMatch[2]).replace(/^animekai:/,'');
+      const meta  = await scraper.getAnimeMeta(rawId);
       return res.status(200).json({ meta });
     }
 
-    // ── /stream/:type/:id.json ────────────────────────────────────────────────
     const streamMatch = path.match(/^\/stream\/([^/]+)\/([^/]+?)\.json$/);
     if (streamMatch) {
-      const rawId        = decodeURIComponent(streamMatch[2]);
-      const parts        = rawId.split(':');
-      const animeId      = parts[1];
-      let   episodeToken = parts[2];
-
-      if (!episodeToken) {
-        const eps  = await scraper.getEpisodeList(animeId);
-        episodeToken = eps?.[0]?.token;
-      }
-
-      const streams = episodeToken
-        ? await scraper.getStreams(animeId, episodeToken)
-        : [];
-
-      console.log(`[Stream] ${animeId} → ${streams.length} streams`);
+      const rawId   = decodeURIComponent(streamMatch[2]).replace(/^animekai:/,'');
+      const parts   = rawId.split(':');
+      const animeId = parts[0];
+      const epNum   = parts[1] || '1';
+      const streams = await scraper.getStreams(animeId, epNum);
+      console.log('[Stream] ' + animeId + ' ep' + epNum + ' -> ' + streams.length + ' streams');
       return res.status(200).json({ streams });
     }
 
     res.status(404).json({ error: 'Not found', path });
-
   } catch (err) {
     console.error('[Error]', err.message);
     res.status(500).json({ error: err.message });
