@@ -1,7 +1,7 @@
 {
   "name": "animekai-stremio-addon",
-  "version": "5.0.0",
-  "description": "AnimeKai Stremio Addon v5 — AniList catalog + HiAnime streams",
+  "version": "6.0.0",
+  "description": "AnimeKai Stremio Addon v6 — AniList + AllAnime streams",
   "main": "api/index.js",
   "dependencies": { "axios": "^1.6.0" },
   "engines": { "node": ">=18" },
