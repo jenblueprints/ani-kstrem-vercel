@@ -1,7 +1,7 @@
 {
   "name": "animekai-stremio-addon",
-  "version": "7.0.0",
-  "description": "AnimeKai Stremio Addon v7 — AniList + AllAnime (fixed sourceUrl field)",
+  "version": "8.0.0",
+  "description": "AnimeKai Stremio Addon v8 — fixed latin1 decode + ok.ru extraction",
   "main": "api/index.js",
   "dependencies": { "axios": "^1.6.0" },
   "engines": { "node": ">=18" },
