@@ -1,9 +1,11 @@
-// scraper.js v6
-// Catalog+Meta : AniList GraphQL  (confirmed working ✓)
-// Streams      : AllAnime API     (api.allanime.day — proper 3-step implementation)
+// scraper.js v7
+// Bug fixes vs v6:
+//   - AllAnime field is `sourceUrl` NOT `url` (was crashing on every stream)
+//   - Source name filter is now case-insensitive
+//   - Null-safe everywhere
 //
-// Title fix: 【OSHI NO KO】Season 3 → OSHI NO KO Season 3
-// AllAnime 3 steps: search → sourceUrls → clock endpoint → actual HLS/mp4
+// Catalog+Meta : AniList GraphQL (confirmed ✓)
+// Streams      : AllAnime API   (api.allanime.day)
 
 const axios = require('axios');
 
@@ -11,12 +13,10 @@ const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,
 const http = axios.create({ timeout: 8000, headers: { 'User-Agent': UA } });
 
 // ─── Title cleaner ────────────────────────────────────────────────────────────
-// 【OSHI NO KO】Season 3  →  OSHI NO KO Season 3
-// 【JJK】                  →  JJK
 function cleanTitle(t) {
   if (!t) return t;
   return t
-    .replace(/【([^】]*)】\s*/g, '$1 ')   // replace 【content】 with "content " (keeps space)
+    .replace(/【([^】]*)】\s*/g, '$1 ')
     .replace(/[〔〕「」『』《》〈〉]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
@@ -41,125 +41,132 @@ function alToMeta(m) {
   };
 }
 
-// ─── AllAnime API — 3-step stream fetching ────────────────────────────────────
+// ─── AllAnime ─────────────────────────────────────────────────────────────────
 const AA_API = 'https://api.allanime.day/api';
-const AA_HEADERS = {
-  'Referer':      'https://allanime.to',
-  'Origin':       'https://allanime.to',
-  'Content-Type': 'application/json',
-  'User-Agent':   UA,
+const AA_H   = {
+  'Referer': 'https://allanime.to',
+  'Origin':  'https://allanime.to',
+  'User-Agent': UA,
 };
 
-// Step 1: search for a show, return its _id
-async function aaSearch(title, translationType = 'sub') {
-  const res = await axios.post(AA_API, {
-    query: `query($search:SearchInput,$limit:Int,$page:Int,$translationType:VaildTranslationTypeEnumType){
-      shows(search:$search,limit:$limit,page:$page,translationType:$translationType){
-        edges{ _id name englishName }
-      }
-    }`,
-    variables: { search: { query: title }, limit: 5, page: 1, translationType },
-  }, { headers: AA_HEADERS, timeout: 8000 });
-  return res.data?.data?.shows?.edges || [];
+async function aaPost(query, variables) {
+  const res = await axios.post(AA_API, { query, variables }, {
+    headers: { ...AA_H, 'Content-Type': 'application/json' },
+    timeout: 8000,
+  });
+  return res.data?.data;
 }
 
-// Step 2: get sourceUrls for a specific episode
-async function aaEpisodeSources(showId, epNum, translationType = 'sub') {
-  const res = await axios.post(AA_API, {
-    query: `query($showId:String!,$episodeString:String!,$translationType:VaildTranslationTypeEnumType!){
-      episode(showId:$showId,translationType:$translationType,episodeString:$episodeString){
-        sourceUrls
-      }
-    }`,
-    variables: { showId, episodeString: String(epNum), translationType },
-  }, { headers: AA_HEADERS, timeout: 8000 });
-  return res.data?.data?.episode?.sourceUrls || [];
+// Search → array of {_id, name}
+async function aaSearch(title, type = 'sub') {
+  const d = await aaPost(
+    `query($s:SearchInput,$t:VaildTranslationTypeEnumType){shows(search:$s,limit:5,page:1,translationType:$t){edges{_id name englishName}}}`,
+    { s: { query: title }, t: type }
+  );
+  return d?.shows?.edges || [];
 }
 
-// Decode AllAnime URL (base64 + ROT13)
-function aaDecodeUrl(url) {
-  if (!url || !url.startsWith('--')) return url;
+// Get sourceUrls for one episode
+// IMPORTANT: field is `sourceUrl` (singular), NOT `url`
+async function aaSourceUrls(showId, epNum, type = 'sub') {
+  const d = await aaPost(
+    `query($id:String!,$ep:String!,$t:VaildTranslationTypeEnumType!){episode(showId:$id,translationType:$t,episodeString:$ep){sourceUrls}}`,
+    { id: showId, ep: String(epNum), t: type }
+  );
+  return d?.episode?.sourceUrls || [];
+}
+
+// Decode --base64rot13 URLs
+function aaDecode(encoded) {
+  if (!encoded || typeof encoded !== 'string') return null;
+  if (!encoded.startsWith('--')) return encoded;
   try {
-    const b64 = url.slice(2);
-    const decoded = Buffer.from(b64, 'base64').toString('utf-8');
-    // ROT13
-    return decoded.replace(/[a-zA-Z]/g, c => {
-      const base = c <= 'Z' ? 65 : 97;
-      return String.fromCharCode(((c.charCodeAt(0) - base + 13) % 26) + base);
+    const b64 = encoded.slice(2);
+    const str = Buffer.from(b64, 'base64').toString('utf-8');
+    return str.replace(/[a-zA-Z]/g, c => {
+      const b = c <= 'Z' ? 65 : 97;
+      return String.fromCharCode(((c.charCodeAt(0) - b + 13) % 26) + b);
     });
-  } catch (_) { return url; }
+  } catch (_) { return null; }
 }
 
-// Step 3: fetch actual HLS/mp4 links from the clock endpoint
-async function aaClockFetch(clockUrl) {
+// Fetch real video links from AllAnime clock endpoint
+async function aaClockLinks(clockUrl) {
+  if (!clockUrl || typeof clockUrl !== 'string') return [];
   try {
     const res = await http.get(clockUrl, {
       headers: { Referer: 'https://allanime.to', Origin: 'https://allanime.to' },
       timeout: 6000,
     });
-    // Response: { links: [{ link: 'https://...m3u8', resolutionStr: '1080', mp4: false }] }
-    return res.data?.links || [];
+    return Array.isArray(res.data?.links) ? res.data.links : [];
   } catch (_) { return []; }
 }
 
-// Full stream pipeline for AllAnime
+// Priority source names (case-insensitive match)
+const GOOD_SOURCES = ['luf-mp4', 's-mp4', 'mp4', 'yt-mp4', 'ok', 'fm-hls'];
+
 async function getAllAnimeStreams(title, epNum) {
   const streams = [];
 
   for (const type of ['sub', 'dub']) {
     try {
-      // Step 1 — find show
       const shows = await aaSearch(title, type);
-      if (!shows.length) continue;
+      if (!shows.length) { console.log(`[AA] No shows for "${title}" (${type})`); continue; }
+
       const show = shows[0];
+      console.log(`[AA] Found: "${show.name || show._id}" for "${title}" (${type})`);
 
-      // Step 2 — get episode sourceUrls
-      const sourceUrls = await aaEpisodeSources(show._id, epNum, type);
+      const sourceUrls = await aaSourceUrls(show._id, epNum, type);
+      console.log(`[AA] ${sourceUrls.length} sources for ep${epNum} (${type}):`, sourceUrls.map(s => s.sourceName).join(', '));
 
-      // Only use Luf-mp4 and S-mp4 sources (these have actual video links)
-      const goodSources = sourceUrls.filter(s =>
-        ['Luf-mp4', 'S-mp4', 'Vd-mp4', 'Yt-mp4', 'Default'].includes(s.sourceName)
-      );
+      // Filter to known-good sources (case-insensitive)
+      const good = sourceUrls.filter(s => GOOD_SOURCES.includes((s.sourceName || '').toLowerCase()));
+      const toProcess = good.length ? good : sourceUrls.slice(0, 4);
 
-      for (const src of goodSources.slice(0, 3)) {
-        let url = src.url;
+      for (const src of toProcess.slice(0, 4)) {
+        // KEY FIX: AllAnime uses `sourceUrl` not `url`
+        const rawUrl = src.sourceUrl;
+        if (!rawUrl || typeof rawUrl !== 'string') continue;
 
         // Decode if encoded
-        if (url.startsWith('--')) url = aaDecodeUrl(url);
-        if (!url.startsWith('http')) continue;
+        const decoded = rawUrl.startsWith('--') ? aaDecode(rawUrl) : rawUrl;
+        if (!decoded || typeof decoded !== 'string') continue;
 
-        // Step 3 — if it's a clock URL, fetch actual video link
-        if (url.includes('allanime.day') && url.includes('clock')) {
-          const links = await aaClockFetch(url);
-          for (const link of links.slice(0, 2)) {
-            if (link.link?.startsWith('http')) {
-              const res = link.resolutionStr || 'auto';
-              streams.push({
-                url:   link.link,
-                name:  `[${type.toUpperCase()}] AllAnime ${res}`,
-                title: `[${type.toUpperCase()}] ${title} Ep${epNum} ${res}`,
-                behaviorHints: {
-                  notWebReady: link.link.includes('.m3u8') || !link.mp4,
-                  headers: { Referer: 'https://allanime.to' },
-                },
-              });
-            }
+        console.log(`[AA] Processing ${src.sourceName}: ${decoded.substring(0, 70)}`);
+
+        // Case 1: AllAnime clock endpoint → fetch real links
+        if (decoded.includes('allanime') || decoded.includes('clock')) {
+          const links = await aaClockLinks(decoded);
+          for (const lnk of links.slice(0, 3)) {
+            const videoUrl = lnk.link || lnk.url;
+            if (!videoUrl || !videoUrl.startsWith('http')) continue;
+            const res = lnk.resolutionStr || lnk.resolution || 'auto';
+            streams.push({
+              url:   videoUrl,
+              name:  `[${type.toUpperCase()}] ${res}`,
+              title: `[${type.toUpperCase()}] ${title} Ep${epNum} ${res}`.trim(),
+              behaviorHints: {
+                notWebReady: !lnk.mp4,
+                headers: { Referer: 'https://allanime.to' },
+              },
+            });
           }
-        } else if (url.includes('.m3u8') || url.includes('.mp4')) {
-          // Direct video URL
+        }
+        // Case 2: Direct .m3u8 or .mp4 link
+        else if (decoded.includes('.m3u8') || decoded.includes('.mp4') || decoded.startsWith('http')) {
           streams.push({
-            url,
-            name:  `[${type.toUpperCase()}] AllAnime`,
-            title: `[${type.toUpperCase()}] ${title} Ep${epNum}`,
+            url:   decoded,
+            name:  `[${type.toUpperCase()}] ${src.sourceName || 'direct'}`,
+            title: `[${type.toUpperCase()}] ${title} Ep${epNum}`.trim(),
             behaviorHints: {
-              notWebReady: url.includes('.m3u8'),
+              notWebReady: decoded.includes('.m3u8'),
               headers: { Referer: 'https://allanime.to' },
             },
           });
         }
       }
     } catch (err) {
-      console.error(`[AllAnime ${type}]`, err.message);
+      console.error(`[AA ${type}] ${err.message}`);
     }
   }
 
@@ -215,30 +222,25 @@ async function getAnimeMeta(rawId) {
     background:  m.bannerImage || undefined,
     genres:      m.genres || undefined,
     videos:      Array.from({ length: Math.min(count, 500) }, (_, i) => ({
-      id:      `animekai:${rawId}:${i + 1}`,
-      title:   `Episode ${i + 1}`,
-      season:  1,
-      episode: i + 1,
+      id: `animekai:${rawId}:${i + 1}`, title: `Episode ${i + 1}`, season: 1, episode: i + 1,
     })),
   };
 }
 
-async function getEpisodeList(rawId) { return []; }
+async function getEpisodeList() { return []; }
 
 // ─── STREAMS ──────────────────────────────────────────────────────────────────
 
 async function getStreams(rawAnimeId, epNum) {
   const alId = parseInt(rawAnimeId.replace(/^al/, ''), 10);
   if (!alId) return [];
-
   try {
     const d     = await anilist(`query($id:Int){Media(id:$id){title{english romaji}}}`, { id: alId });
     const title = cleanTitle(d?.Media?.title?.english || d?.Media?.title?.romaji);
     if (!title) return [];
-
-    console.log(`[Streams] Searching AllAnime for: "${title}" ep${epNum}`);
+    console.log(`[Streams] "${title}" ep${epNum}`);
     const streams = await getAllAnimeStreams(title, epNum);
-    console.log(`[Streams] Found ${streams.length} streams`);
+    console.log(`[Streams] ${streams.length} streams found`);
     return streams;
   } catch (err) {
     console.error('[getStreams]', err.message);
@@ -249,42 +251,49 @@ async function getStreams(rawAnimeId, epNum) {
 // ─── DEBUG ────────────────────────────────────────────────────────────────────
 
 async function getDebugInfo() {
-  const result = { anilist: null, allanime: null, errors: {} };
+  const out = { anilist: null, allanime: null, streamTest: null, errors: {} };
 
   try {
     const d = await getTrending(0);
-    result.anilist = { working: true, count: d.length, sample: d.slice(0, 3).map(a => a.name) };
-  } catch (e) { result.errors.anilist = e.message; }
+    out.anilist = { working: true, count: d.length, sample: d.slice(0, 3).map(a => a.name) };
+  } catch (e) { out.errors.anilist = e.message; }
 
   try {
-    // Test AllAnime search
     const shows = await aaSearch('Naruto', 'sub');
-    if (shows.length) {
-      // Test episode sources
-      const srcs = await aaEpisodeSources(shows[0]._id, '1', 'sub');
-      result.allanime = {
-        working:      true,
-        showFound:    shows[0].name || shows[0]._id,
-        sourcesCount: srcs.length,
-        sourceNames:  srcs.map(s => s.sourceName).join(', '),
-      };
+    if (!shows.length) throw new Error('search returned 0 results');
+    const srcs = await aaSourceUrls(shows[0]._id, '1', 'sub');
+    out.allanime = {
+      showFound:    shows[0].name || shows[0]._id,
+      sourcesCount: srcs.length,
+      // Show actual field names
+      firstSrc:     srcs[0] ? { sourceName: srcs[0].sourceName, hasSourceUrl: !!srcs[0].sourceUrl, hasUrl: !!srcs[0].url } : null,
+      sourceNames:  srcs.map(s => s.sourceName).join(', '),
+    };
 
-      // Test clock URL resolution
-      const luf = srcs.find(s => ['Luf-mp4', 'S-mp4'].includes(s.sourceName));
-      if (luf) {
-        const decoded = aaDecodeUrl(luf.url);
-        result.allanime.clockUrl = decoded.substring(0, 60) + '...';
-        if (decoded.includes('clock')) {
-          const links = await aaClockFetch(decoded);
-          result.allanime.clockLinks = links.slice(0, 2).map(l => ({ res: l.resolutionStr, url: (l.link || '').substring(0, 50) }));
-        }
+    // Test decode + clock
+    const luf = srcs.find(s => (s.sourceName || '').toLowerCase().includes('luf') || (s.sourceName || '').toLowerCase().includes('mp4'));
+    if (luf?.sourceUrl) {
+      const decoded = aaDecode(luf.sourceUrl) || luf.sourceUrl;
+      out.allanime.decodedUrl = (decoded || '').substring(0, 80);
+      if (decoded && (decoded.includes('allanime') || decoded.includes('clock'))) {
+        const links = await aaClockLinks(decoded);
+        out.allanime.clockLinksCount = links.length;
+        out.allanime.clockSample     = links.slice(0, 2).map(l => ({ res: l.resolutionStr, url: (l.link||'').substring(0,60) }));
+        out.allanime.working         = links.length > 0;
+      } else if (decoded) {
+        out.allanime.working = true;
+        out.allanime.directUrl = decoded.substring(0, 80);
       }
-    } else {
-      result.allanime = { working: false, reason: 'search returned 0 results' };
     }
-  } catch (e) { result.errors.allanime = e.message; }
+  } catch (e) { out.errors.allanime = e.message; }
 
-  return result;
+  // Test a real anime stream
+  try {
+    const streams = await getAllAnimeStreams('Naruto', '1');
+    out.streamTest = { count: streams.length, sample: streams.slice(0, 2).map(s => ({ name: s.name, urlStart: (s.url||'').substring(0,50) })) };
+  } catch (e) { out.errors.streamTest = e.message; }
+
+  return out;
 }
 
 module.exports = { getTrending, getLatest, searchAnime, getMovies, getAnimeMeta, getEpisodeList, getStreams, getDebugInfo };
