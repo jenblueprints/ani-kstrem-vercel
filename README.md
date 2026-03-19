@@ -1,4 +1,4 @@
-# AnimeKai Stremio Addon — Vercel Edition
+# Anime Stremio Addon — Vercel Edition
 
 **100% Free. No credit card. No sign-up payment. Works on every device.**
 
