@@ -1,7 +1,7 @@
 {
   "name": "animekai-stremio-addon",
-  "version": "8.0.0",
-  "description": "AnimeKai Stremio Addon v8 — fixed latin1 decode + ok.ru extraction",
+  "version": "9.0.0",
+  "description": "AnimeKai Stremio Addon v9 — fixed ok.ru JSON + multi-decode + responseType:text",
   "main": "api/index.js",
   "dependencies": { "axios": "^1.6.0" },
   "engines": { "node": ">=18" },
