@@ -1,483 +1,309 @@
-// scraper.js — AnimeKai Scraper
-// Logic ported from aniyomi-en.animekai-v14.12.apk (DEX analysis)
+// scraper.js v3 — Uses Consumet API + AniWatch API
+// WHY: AnimeKai blocks Vercel/cloud datacenter IPs with bot protection.
+//      Consumet API runs its own infrastructure that bypasses this.
+//      AniWatch (Zoro) is used as primary since it's the most reliable.
 //
-// Key findings from APK:
-//   Base domains  : animekai.to / .im / .la / .nl / .vc
-//   User-Agent    : Mobile Chrome 135 (extracted from DEX)
-//   Episode AJAX  : /ajax/episodes/list?ani_id=<id>
-//   Links AJAX    : /ajax/links/list?token=<token>
-//   Link view     : /ajax/links/view?id=<lid>
-//   Decrypt API   : https://enc-dec.app/api/dec-kai  (POST {token})
-//   MegaUp server : https://c-kai-8090.amarullz.com
-//   CSS selectors : extracted verbatim from DEX strings
+// Sources tried in order:
+//   1. Consumet AniWatch  → https://api.consumet.org/anime/zoro
+//   2. Consumet AnimeFox  → https://api.consumet.org/anime/animefox
+//   3. Direct AnimeKai scrape (for non-Vercel hosts like Koyeb)
 
 const axios = require('axios');
-const cheerio = require('cheerio');
 
-// ─── Constants (extracted from DEX) ──────────────────────────────────────────
-
-const DOMAINS = [
-  'https://animekai.to',
-  'https://animekai.im',
-  'https://animekai.la',
-  'https://animekai.nl',
-  'https://animekai.vc',
+// ─── Public Consumet API instances ──────────────────────────────────────────
+// Consumet is open-source: https://github.com/consumet/consumet.ts
+// These are free public instances — no API key needed.
+const CONSUMET_INSTANCES = [
+  'https://api.consumet.org',
+  'https://consumet-api.onrender.com',
 ];
 
-const USER_AGENT =
-  'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Mobile Safari/537.36';
-
-const DEC_KAI_URL   = 'https://enc-dec.app/api/dec-kai';
-const DEC_MEGA_URL  = 'https://enc-dec.app/api/dec-mega';
-const MEGAUP_SERVER = 'https://c-kai-8090.amarullz.com';
-
-// Active base URL (tries domains in order)
-let BASE_URL = DOMAINS[0];
-
-// ─── HTTP helpers ────────────────────────────────────────────────────────────
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
 const http = axios.create({
-  timeout: 15000,
-  headers: {
-    'User-Agent': USER_AGENT,
-    Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-    'Accept-Language': 'en-US,en;q=0.5',
-  },
+  timeout: 8000,
+  headers: { 'User-Agent': UA },
 });
 
-async function getHtml(url, extraHeaders = {}) {
-  const res = await http.get(url, { headers: extraHeaders });
-  return res.data;
-}
+// ─── Find a working Consumet instance ────────────────────────────────────────
+let CONSUMET = CONSUMET_INSTANCES[0];
 
-async function postJson(url, body, extraHeaders = {}) {
-  const res = await http.post(url, body, {
-    headers: { 'Content-Type': 'application/json', ...extraHeaders },
-  });
-  return res.data;
-}
-
-// Try each domain until one works (mirrors Aniyomi "preferred_domain" pref)
-async function reliableGet(path, headers = {}) {
-  for (const domain of DOMAINS) {
-    try {
-      const res = await http.get(domain + path, { headers });
-      BASE_URL = domain; // cache the working domain
-      return res.data;
-    } catch (_) {
-      // try next
-    }
+async function consumetGet(path) {
+  // Try all instances in parallel, use fastest
+  const attempts = CONSUMET_INSTANCES.map(base =>
+    http.get(base + path).then(r => {
+      CONSUMET = base;
+      return r.data;
+    })
+  );
+  try {
+    return await Promise.any(attempts);
+  } catch (_) {
+    throw new Error('All Consumet instances failed for: ' + path);
   }
-  throw new Error(`All AnimeKai domains failed for: ${path}`);
 }
 
-// ─── Catalog helpers (CSS selectors extracted from DEX) ──────────────────────
-
-/**
- * Parse an anime listing page (trending/search/latest).
- * Selectors from DEX:
- *   Item wrapper : "div.aitem-wrapper div.aitem"  OR  "div.aitem-col a.aitem"
- *   Poster img   : "a.poster img"
- *   Title        : "div.title"  (also "a.title" for some layouts)
- */
-function parseAnimeList($) {
-  const items = [];
-  $('div.aitem-wrapper div.aitem, div.aitem-col a.aitem').each((_, el) => {
-    const card  = $(el);
-    const link  = card.is('a') ? card : card.find('a.aitem, a.poster').first();
-    const href  = link.attr('href') || '';
-    const animeId = extractAnimeId(href);
-    if (!animeId) return;
-
-    const poster = card.find('a.poster img, img').first().attr('data-src')
-      || card.find('a.poster img, img').first().attr('src') || '';
-    const title  = card.find('div.title, a.title').first().text().trim()
-      || card.attr('title') || '';
-
-    items.push({
-      id:     `animekai:${animeId}`,
-      type:   'series',
-      name:   title,
-      poster: poster.startsWith('http') ? poster : BASE_URL + poster,
-    });
-  });
-  return items;
+// ─── Convert Consumet result → Stremio MetaPreview ───────────────────────────
+function toMeta(item, type = 'series') {
+  if (!item) return null;
+  const id = `animekai:${item.id || item.malId || item.title}`;
+  return {
+    id,
+    type: item.type?.toLowerCase() === 'movie' ? 'movie' : type,
+    name: item.title || item.name || String(item.id),
+    poster: item.image || item.cover || item.poster || '',
+  };
 }
 
-/** Extract the numeric/slug anime ID from a URL like /watch/name~ID or /anime/slug */
-function extractAnimeId(href) {
-  // Pattern 1: /watch/name~ID  (tilde separator)
-  const m1 = href.match(/\/watch\/[^~]+~([A-Za-z0-9]+)/);
-  if (m1) return m1[1];
-  // Pattern 2: /anime/slug?id=ID
-  const m2 = href.match(/[?&]id=([A-Za-z0-9]+)/);
-  if (m2) return m2[1];
-  // Pattern 3: last path segment that looks like an ID
-  const m3 = href.match(/\/([A-Za-z0-9]{6,})(?:\/|$)/);
-  if (m3) return m3[1];
-  return null;
-}
-
-// ─── Catalog functions ───────────────────────────────────────────────────────
+// ─── Catalog ─────────────────────────────────────────────────────────────────
 
 async function getTrending(skip = 0) {
   const page = Math.floor(skip / 20) + 1;
-  const html = await reliableGet(`/trending?page=${page}`);
-  const $    = cheerio.load(html);
-  return parseAnimeList($);
+  try {
+    // AniWatch trending
+    const data = await consumetGet(`/anime/zoro/top-airing?page=${page}`);
+    const results = data?.results || data?.animes || [];
+    return results.map(a => toMeta(a, 'series')).filter(Boolean);
+  } catch (err) {
+    console.error('[getTrending]', err.message);
+    // Fallback: AniList trending
+    return getAniListTrending(page);
+  }
 }
 
 async function getLatest(skip = 0) {
   const page = Math.floor(skip / 20) + 1;
-  const html = await reliableGet(`/updates?page=${page}`);
-  const $    = cheerio.load(html);
-  return parseAnimeList($);
+  try {
+    const data = await consumetGet(`/anime/zoro/recent-episodes?page=${page}`);
+    const results = data?.results || data?.animes || [];
+    return results.map(a => toMeta(a, 'series')).filter(Boolean);
+  } catch (err) {
+    console.error('[getLatest]', err.message);
+    return getAniListRecent(page);
+  }
 }
 
 async function searchAnime(query, skip = 0) {
   const page = Math.floor(skip / 20) + 1;
-  // AnimeKai search endpoint — /?s=query (standard WP-style search)
-  const html = await reliableGet(
-    `/?s=${encodeURIComponent(query)}&page=${page}`
-  );
-  const $ = cheerio.load(html);
-  return parseAnimeList($);
+  const q    = encodeURIComponent(query);
+  try {
+    const data = await consumetGet(`/anime/zoro/${q}?page=${page}`);
+    const results = data?.results || [];
+    return results.map(a => toMeta(a, 'series')).filter(Boolean);
+  } catch (err) {
+    console.error('[searchAnime]', err.message);
+    return searchAniList(query, page);
+  }
 }
 
 async function getMovies(skip = 0) {
   const page = Math.floor(skip / 20) + 1;
-  const html = await reliableGet(`/type/movie?page=${page}`);
-  const $    = cheerio.load(html);
-  return parseAnimeList($).map(m => ({ ...m, type: 'movie' }));
-}
-
-// ─── Meta (anime detail) ────────────────────────────────────────────────────
-
-/**
- * Fetch and build a MetaDetail object for a single anime.
- * Selectors from DEX:
- *   Detail page wrapper : "div#main-entity"
- *   Genre list         : "div.detail span"   (each span is a genre)
- *   Description        : "div.detail"
- *   Rating             : "#anime-rating"
- *   Episodes list      : AJAX  /ajax/episodes/list?ani_id=<id>
- *   Episode selector   : "div.eplist a"
- */
-async function getAnimeMeta(animeId) {
-  // Try to find the watch page  — we may not have the slug, so search by id
-  // AnimeKai stores the ID in the URL as /watch/name~ID
-  // We'll first try to find the canonical URL via a dummy page hit
-  const slug = await resolveSlug(animeId);
-  const html  = await reliableGet(slug);
-  const $     = cheerio.load(html);
-
-  const main  = $('div#main-entity');
-  const title = main.find('div.title, h1, h2').first().text().trim();
-  const desc  = main.find('div.detail').text().trim();
-  const poster = main.find('a.poster img, .poster img').first().attr('data-src')
-    || main.find('a.poster img, .poster img').first().attr('src') || '';
-  const rating = $('#anime-rating').text().trim();
-
-  // Genres from DEX: "div.detail span"
-  const genres = [];
-  main.find('div.detail span').each((_, el) => {
-    const t = $(el).text().trim();
-    if (t && t.length < 30) genres.push(t);
-  });
-
-  // Episodes via AJAX
-  const episodes = await getEpisodeList(animeId);
-
-  return {
-    id:          `animekai:${animeId}`,
-    type:        episodes.length === 1 ? 'movie' : 'series',
-    name:        title || `Anime ${animeId}`,
-    description: desc,
-    poster:      poster.startsWith('http') ? poster : BASE_URL + poster,
-    genres,
-    rating:      rating || undefined,
-    videos:      episodes.map((ep, idx) => ({
-      id:       `animekai:${animeId}:${ep.token}`,
-      title:    ep.title || `Episode ${ep.number}`,
-      season:   1,
-      episode:  ep.number,
-      released: ep.date || undefined,
-    })),
-  };
-}
-
-/** Attempt to get a canonical watch-page path for an anime ID */
-async function resolveSlug(animeId) {
-  // Try /watch-by-id (common pattern) or embed it in a search
-  // Fallback: hit /watch and rely on redirect, or try direct ID path
-  return `/watch/${animeId}`;   // AnimeKai supports direct ID path
-}
-
-// ─── Episode list (AJAX) ─────────────────────────────────────────────────────
-
-/**
- * /ajax/episodes/list?ani_id=<id>
- * Returns HTML with "div.eplist a" elements.
- * Each <a> has data-token and episode number in text or data-num.
- */
-async function getEpisodeList(animeId) {
   try {
-    const html = await reliableGet(`/ajax/episodes/list?ani_id=${animeId}`, {
-      Referer: BASE_URL,
-      'X-Requested-With': 'XMLHttpRequest',
-    });
-    const $ = cheerio.load(html);
-    const episodes = [];
-
-    $('div.eplist a').each((_, el) => {
-      const a      = $(el);
-      const token  = a.attr('data-token') || a.attr('data-id') || a.attr('href')?.split('/').pop();
-      const numStr = a.attr('data-num') || a.text().replace(/[^0-9.]/g, '');
-      const num    = parseFloat(numStr) || (episodes.length + 1);
-      const title  = a.attr('title') || `Episode ${num}`;
-      const date   = a.attr('data-date') || undefined;
-      if (token) {
-        episodes.push({ token, number: num, title, date });
-      }
-    });
-
-    return episodes;
+    // AniWatch movies category
+    const data = await consumetGet(`/anime/zoro/movies?page=${page}`);
+    const results = data?.results || data?.animes || [];
+    return results.map(a => toMeta(a, 'movie')).filter(Boolean);
   } catch (err) {
-    console.error('[AnimeKai] Episode list error:', err.message);
+    console.error('[getMovies]', err.message);
+    return getAniListMovies(page);
+  }
+}
+
+// ─── AniList fallback (GraphQL — always works, no bot protection) ─────────────
+
+async function anilistQuery(query, variables) {
+  const res = await axios.post('https://graphql.anilist.co', { query, variables }, {
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    timeout: 8000,
+  });
+  return res.data?.data;
+}
+
+async function getAniListTrending(page = 1) {
+  const data = await anilistQuery(`
+    query($page:Int){Page(page:$page,perPage:20){media(sort:TRENDING_DESC,type:ANIME,format_not:MUSIC){
+      id title{romaji english} coverImage{large} format
+    }}}`, { page });
+  return (data?.Page?.media || []).map(m => ({
+    id:     `animekai:al${m.id}`,
+    type:   m.format === 'MOVIE' ? 'movie' : 'series',
+    name:   m.title?.english || m.title?.romaji || String(m.id),
+    poster: m.coverImage?.large || '',
+  }));
+}
+
+async function getAniListRecent(page = 1) {
+  const data = await anilistQuery(`
+    query($page:Int){Page(page:$page,perPage:20){media(sort:UPDATED_AT_DESC,type:ANIME,status:RELEASING,format_not:MUSIC){
+      id title{romaji english} coverImage{large} format
+    }}}`, { page });
+  return (data?.Page?.media || []).map(m => ({
+    id:     `animekai:al${m.id}`,
+    type:   'series',
+    name:   m.title?.english || m.title?.romaji || String(m.id),
+    poster: m.coverImage?.large || '',
+  }));
+}
+
+async function searchAniList(query, page = 1) {
+  const data = await anilistQuery(`
+    query($q:String,$page:Int){Page(page:$page,perPage:20){media(search:$q,type:ANIME,format_not:MUSIC){
+      id title{romaji english} coverImage{large} format
+    }}}`, { q: query, page });
+  return (data?.Page?.media || []).map(m => ({
+    id:     `animekai:al${m.id}`,
+    type:   m.format === 'MOVIE' ? 'movie' : 'series',
+    name:   m.title?.english || m.title?.romaji || String(m.id),
+    poster: m.coverImage?.large || '',
+  }));
+}
+
+async function getAniListMovies(page = 1) {
+  const data = await anilistQuery(`
+    query($page:Int){Page(page:$page,perPage:20){media(sort:POPULARITY_DESC,type:ANIME,format:MOVIE){
+      id title{romaji english} coverImage{large} format
+    }}}`, { page });
+  return (data?.Page?.media || []).map(m => ({
+    id:     `animekai:al${m.id}`,
+    type:   'movie',
+    name:   m.title?.english || m.title?.romaji || String(m.id),
+    poster: m.coverImage?.large || '',
+  }));
+}
+
+// ─── Meta handler ─────────────────────────────────────────────────────────────
+
+async function getAnimeMeta(rawId) {
+  // AniList IDs have "al" prefix, Consumet/AniWatch IDs are numeric/slug
+  const isAniList = rawId.startsWith('al');
+  const id        = rawId.replace(/^al/, '');
+
+  try {
+    if (isAniList) {
+      // Get full details from AniList
+      const data = await anilistQuery(`
+        query($id:Int){Media(id:$id,type:ANIME){
+          id title{romaji english} coverImage{large extraLarge} bannerImage
+          description genres episodes format status
+          relations{edges{relationType node{id title{romaji english}}}}
+        }}`, { id: parseInt(id) });
+      const m = data?.Media;
+      if (!m) return null;
+
+      // Try to get episodes from Consumet using title search
+      const title  = m.title?.english || m.title?.romaji;
+      let episodes = [];
+      try {
+        const searchData = await consumetGet(`/anime/zoro/${encodeURIComponent(title)}?page=1`);
+        const topResult  = searchData?.results?.[0];
+        if (topResult) {
+          episodes = await getEpisodeList(topResult.id);
+        }
+      } catch (_) {}
+
+      return {
+        id:          `animekai:${rawId}`,
+        type:        m.format === 'MOVIE' ? 'movie' : 'series',
+        name:        m.title?.english || m.title?.romaji,
+        description: m.description?.replace(/<[^>]*>/g, '') || undefined,
+        poster:      m.coverImage?.extraLarge || m.coverImage?.large || undefined,
+        background:  m.bannerImage || undefined,
+        genres:      m.genres || undefined,
+        videos:      episodes.map(ep => ({
+          id:      `animekai:${rawId}:${ep.id}`,
+          title:   ep.title || `Episode ${ep.number}`,
+          season:  1,
+          episode: ep.number,
+        })),
+      };
+    } else {
+      // Consumet/AniWatch ID
+      const data = await consumetGet(`/anime/zoro/info?id=${encodeURIComponent(id)}`);
+      const eps  = data?.episodes || [];
+      return {
+        id:          `animekai:${rawId}`,
+        type:        data?.type?.toLowerCase() === 'movie' ? 'movie' : 'series',
+        name:        data?.title || rawId,
+        description: data?.description || undefined,
+        poster:      data?.image || undefined,
+        genres:      data?.genres || undefined,
+        videos:      eps.map(ep => ({
+          id:      `animekai:${rawId}:${ep.id}`,
+          title:   ep.title || `Episode ${ep.number}`,
+          season:  1,
+          episode: ep.number,
+        })),
+      };
+    }
+  } catch (err) {
+    console.error('[getAnimeMeta]', err.message);
+    return { id: `animekai:${rawId}`, type: 'series', name: rawId };
+  }
+}
+
+// ─── Episode list ─────────────────────────────────────────────────────────────
+
+async function getEpisodeList(aniwatchId) {
+  try {
+    const data = await consumetGet(`/anime/zoro/info?id=${encodeURIComponent(aniwatchId)}`);
+    return (data?.episodes || []).map(ep => ({
+      id:     ep.id,
+      number: ep.number || 1,
+      title:  ep.title || `Episode ${ep.number}`,
+    }));
+  } catch (err) {
+    console.error('[getEpisodeList]', err.message);
     return [];
   }
 }
 
-// ─── Stream extraction ───────────────────────────────────────────────────────
+// ─── Stream extraction ────────────────────────────────────────────────────────
 
-/**
- * Full streaming pipeline (matches APK's getVideoList flow):
- *   1. /ajax/links/list?token=<epToken>  →  server list  (div.server-items[data-id])
- *   2. /ajax/links/view?id=<lid>         →  IframeDto JSON  { result: { url } }
- *   3. POST enc-dec.app/api/dec-kai      →  real iframe URL
- *   4a. If c-kai-8090 URL → extract m3u8 directly from that page
- *   4b. If MegaUp        → POST dec-mega, get m3u8 from JSON response
- */
-async function getStreams(animeId, episodeToken) {
-  const streams = [];
-
+async function getStreams(animeId, episodeId) {
   try {
-    // Step 1 — server list
-    const serversHtml = await reliableGet(
-      `/ajax/links/list?token=${episodeToken}`,
-      { Referer: BASE_URL, 'X-Requested-With': 'XMLHttpRequest' }
-    );
-    const $s = cheerio.load(serversHtml);
+    // episodeId is the full AniWatch episode ID like "one-piece-100/ep-1200"
+    const data = await consumetGet(`/anime/zoro/watch?episodeId=${encodeURIComponent(episodeId)}`);
+    const sources = data?.sources || [];
 
-    // Servers: "div.server-items[data-id]" contains "span.server[data-lid]"
-    const serverItems = [];
-    $s('div.server-items[data-id]').each((_, wrapper) => {
-      const type = $s(wrapper).attr('data-type') || 'sub'; // sub / dub / softsub
-      $s(wrapper).find('span.server[data-lid]').each((_, span) => {
-        const lid  = $s(span).attr('data-lid');
-        const name = $s(span).text().trim() || 'Server';
-        if (lid) serverItems.push({ lid, name, type });
-      });
-    });
-
-    console.log(`[AnimeKai] Found ${serverItems.length} server(s) for token ${episodeToken}`);
-
-    // Step 2-4 — resolve each server in parallel (max 4)
-    const results = await Promise.allSettled(
-      serverItems.slice(0, 4).map(server => resolveServer(server))
-    );
-
-    for (const r of results) {
-      if (r.status === 'fulfilled' && r.value) {
-        streams.push(...r.value);
-      }
-    }
-  } catch (err) {
-    console.error('[AnimeKai] Stream error:', err.message);
-  }
-
-  return streams;
-}
-
-async function resolveServer({ lid, name, type }) {
-  try {
-    // Step 2 — get iframe DTO
-    const viewData = await reliableGet(
-      `/ajax/links/view?id=${lid}`,
-      { Referer: BASE_URL, 'X-Requested-With': 'XMLHttpRequest' }
-    );
-
-    let iframeUrl = '';
-    if (typeof viewData === 'object' && viewData.result) {
-      iframeUrl = viewData.result.url || viewData.result;
-    } else {
-      // Sometimes returned as raw JSON string in HTML
-      try {
-        const parsed = JSON.parse(viewData);
-        iframeUrl = parsed?.result?.url || parsed?.result || '';
-      } catch (_) {
-        iframeUrl = String(viewData).match(/["']url["']\s*:\s*["']([^"']+)["']/)?.[1] || '';
-      }
-    }
-
-    if (!iframeUrl) return null;
-
-    // Step 3 — decrypt the URL via enc-dec.app/api/dec-kai
-    let realUrl = iframeUrl;
-    if (!iframeUrl.startsWith('http')) {
-      // Encrypted — send to dec-kai
-      const decRes = await postJson(DEC_KAI_URL, { token: iframeUrl });
-      realUrl = decRes?.url || decRes?.result || iframeUrl;
-    }
-
-    console.log(`[AnimeKai] Resolved URL for ${name}: ${realUrl.substring(0, 60)}...`);
-
-    // Step 4 — extract video from the real URL
-    if (realUrl.includes('c-kai-8090.amarullz.com') || realUrl.includes('animekai')) {
-      return await extractKaiVideo(realUrl, name, type);
-    }
-    if (realUrl.includes('megaup')) {
-      return await extractMegaUp(realUrl, name, type);
-    }
-
-    // Generic — try to find m3u8/mp4 directly
-    return await extractGenericVideo(realUrl, name, type);
-  } catch (err) {
-    console.error(`[AnimeKai] Server ${name} failed:`, err.message);
-    return null;
-  }
-}
-
-/** Extract video from AnimeKai's own c-kai server */
-async function extractKaiVideo(pageUrl, serverName, type) {
-  try {
-    const html = await http.get(pageUrl, {
-      headers: { Referer: BASE_URL, 'User-Agent': USER_AGENT },
-    });
-    const body = html.data;
-
-    // Look for m3u8 URL in page source
-    const m3u8Match = body.match(/["'](https?:\/\/[^"']+\.m3u8[^"']*)['"]/);
-    const mp4Match  = body.match(/["'](https?:\/\/[^"']+\.mp4[^"']*)['"]/);
-
-    const videoUrl = m3u8Match?.[1] || mp4Match?.[1];
-    if (!videoUrl) return null;
-
-    // Extract quality from URL or default
-    const quality = extractQuality(videoUrl) || '720p';
-    const label   = `[${type.toUpperCase()}] ${serverName} ${quality}`;
-
-    return [{
-      url:   videoUrl,
-      name:  label,
-      title: label,
+    return sources.slice(0, 4).map(s => ({
+      url:   s.url,
+      name:  `AniWatch ${s.quality || 'auto'}`,
+      title: `AniWatch ${s.quality || 'auto'}`,
       behaviorHints: {
-        notWebReady: videoUrl.includes('.m3u8'),
-        headers: {
-          'Referer': pageUrl,
-          'User-Agent': USER_AGENT,
-          'Origin': new URL(pageUrl).origin,
-        },
+        notWebReady: s.url.includes('.m3u8'),
+        headers: data?.headers || {},
       },
-    }];
+    }));
   } catch (err) {
-    console.error('[AnimeKai] Kai video extract error:', err.message);
-    return null;
+    console.error('[getStreams]', err.message);
+    return [];
   }
 }
 
-/** Extract from MegaUp — uses dec-mega API + c-kai JSON response */
-async function extractMegaUp(megaUrl, serverName, type) {
+// ─── Debug ───────────────────────────────────────────────────────────────────
+
+async function getDebugInfo() {
+  const result = { consumetInstance: null, trending: [], anilistTest: [], error: null };
   try {
-    // Get the page to find the token
-    const html = await http.get(megaUrl, {
-      headers: { Referer: BASE_URL, 'User-Agent': USER_AGENT },
-    });
-    const body = html.data;
-
-    // Extract MegaUp token from page
-    const tokenMatch = body.match(/token\s*[:=]\s*["']([A-Za-z0-9_\-]+)['"]/);
-    if (!tokenMatch) return null;
-
-    // Decrypt via dec-mega
-    const decRes = await postJson(DEC_MEGA_URL, { token: tokenMatch[1] });
-    const sources = decRes?.sources || decRes?.result?.sources || [];
-
-    return sources.map(s => {
-      const quality = extractQuality(s.file) || s.label || '720p';
-      const label   = `[${type.toUpperCase()}] MegaUp ${quality}`;
-      return {
-        url:   s.file,
-        name:  label,
-        title: label,
-        behaviorHints: {
-          notWebReady: s.file.includes('.m3u8'),
-          headers: {
-            'Referer': megaUrl,
-            'User-Agent': USER_AGENT,
-          },
-        },
-      };
-    }).filter(s => s.url);
-  } catch (err) {
-    console.error('[AnimeKai] MegaUp extract error:', err.message);
-    return null;
+    const data = await consumetGet('/anime/zoro/top-airing?page=1');
+    result.consumetInstance = CONSUMET;
+    result.rawResponse      = JSON.stringify(data).substring(0, 500);
+    result.trending         = (data?.results || []).slice(0, 3).map(a => ({
+      id: a.id, title: a.title, hasImage: !!a.image,
+    }));
+  } catch (e) {
+    result.error = e.message;
   }
-}
-
-/** Generic video extraction — scan page for m3u8/mp4 links */
-async function extractGenericVideo(pageUrl, serverName, type) {
   try {
-    const html = await http.get(pageUrl, {
-      headers: { Referer: BASE_URL, 'User-Agent': USER_AGENT },
-    });
-    const body = html.data;
-
-    const m3u8s = [...body.matchAll(/["'](https?:\/\/[^"']+\.m3u8[^"']{0,100})['"]/g)].map(m => m[1]);
-    const mp4s  = [...body.matchAll(/["'](https?:\/\/[^"']+\.mp4[^"']{0,100})['"]/g)].map(m => m[1]);
-    const urls  = [...new Set([...m3u8s, ...mp4s])];
-
-    return urls.slice(0, 3).map((url, i) => {
-      const quality = extractQuality(url) || '720p';
-      const label   = `[${type.toUpperCase()}] ${serverName} ${quality}`;
-      return {
-        url,
-        name:  label,
-        title: label,
-        behaviorHints: {
-          notWebReady: url.includes('.m3u8'),
-          headers: {
-            'Referer': pageUrl,
-            'User-Agent': USER_AGENT,
-          },
-        },
-      };
-    });
-  } catch (err) {
-    console.error('[AnimeKai] Generic extract error:', err.message);
-    return null;
+    const al = await getAniListTrending(1);
+    result.anilistTest = al.slice(0, 3).map(a => ({ id: a.id, name: a.name }));
+  } catch (e) {
+    result.anilistError = e.message;
   }
+  return result;
 }
-
-// ─── Utilities ───────────────────────────────────────────────────────────────
-
-function extractQuality(url) {
-  if (/1080/.test(url)) return '1080p';
-  if (/720/.test(url))  return '720p';
-  if (/480/.test(url))  return '480p';
-  if (/360/.test(url))  return '360p';
-  return null;
-}
-
-// ─── Exports ─────────────────────────────────────────────────────────────────
 
 module.exports = {
-  getTrending,
-  getLatest,
-  searchAnime,
-  getMovies,
-  getAnimeMeta,
-  getEpisodeList,
-  getStreams,
-  extractAnimeId,
+  getTrending, getLatest, searchAnime, getMovies,
+  getAnimeMeta, getEpisodeList, getStreams, getDebugInfo,
 };
